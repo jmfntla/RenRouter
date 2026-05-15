@@ -347,29 +347,25 @@ def build_diagram_pages(image_dims):
     return pages
 
 
-def remove_sectPr_from_paras(para_elements):
-    """Strip all w:sectPr from the given paragraph elements' pPr (in-place)."""
-    for p in para_elements:
-        for pPr in p.findall(qn('w', 'pPr')):
-            for sect in pPr.findall(qn('w', 'sectPr')):
-                pPr.remove(sect)
-
-
-def build_portrait_sect_pr_standard() -> etree._Element:
-    """Standard portrait section with original document margins for pre/post content."""
-    sectPr = etree.Element(qn('w', 'sectPr'))
-    pgSz   = etree.SubElement(sectPr, qn('w', 'pgSz'),
-                               **{qn('w', 'w'): '12240',
-                                  qn('w', 'h'): '15840'})
-    pgMar  = etree.SubElement(sectPr, qn('w', 'pgMar'),
-                               **{qn('w', 'top'):    '1080',
-                                  qn('w', 'right'):  '720',
-                                  qn('w', 'bottom'): '1440',
-                                  qn('w', 'left'):   '1440',
-                                  qn('w', 'header'): '720',
-                                  qn('w', 'footer'): '720',
-                                  qn('w', 'gutter'): '0'})
-    return sectPr
+def make_pre_content_section_end(original_sect_pr_177: etree._Element) -> etree._Element:
+    """
+    Build the sectPr that will close the pre-content section at para 165.
+    Clone the original 2-column portrait sectPr (para 177) but use nextPage
+    so the first diagram starts on a fresh page.
+    """
+    sect = copy.deepcopy(original_sect_pr_177)
+    # Remove rsid attributes to avoid conflicts
+    for attr in list(sect.attrib):
+        sect.attrib.pop(attr)
+    # Replace continuous break type with nextPage
+    typ = sect.find(qn('w', 'type'))
+    if typ is not None:
+        typ.set(qn('w', 'val'), 'nextPage')
+    else:
+        typ = etree.SubElement(sect, qn('w', 'type'))
+        typ.set(qn('w', 'val'), 'nextPage')
+        sect.insert(0, typ)
+    return sect
 
 
 def main():
@@ -383,19 +379,35 @@ def main():
     tree = etree.fromstring(doc_xml_bytes)
     body = tree.find(qn('w', 'body'))
 
-    # Collect all direct children of body (paragraphs, tables, sectPr)
-    all_children = list(body)
+    # ── Map paragraph index → body child element ──────────────────────────────
+    # Body may have w:p and w:tbl children (and final w:sectPr).
+    # We walk children to map para indices.
+    para_index = 0
+    para_to_child = {}   # para_idx → body child element
+    for child in body:
+        if child.tag == qn('w', 'p'):
+            para_to_child[para_index] = child
+            para_index += 1
+        elif child.tag == qn('w', 'tbl'):
+            pass  # tables don't count as paragraphs in our index
 
-    # ── Identify paragraph elements (skip body-level sectPr) ─────────────────
-    # Para index to body-child index mapping
-    para_els = [c for c in all_children if c.tag == qn('w', 'p')]
+    total_paras = para_index
+    print(f"Total paragraph elements: {total_paras}")
 
-    print(f"Total paragraph elements: {len(para_els)}")
+    # ── Paragraph boundaries ──────────────────────────────────────────────────
+    # Para 165: last pre-diagram paragraph ("Requirement Analysis")
+    # Para 166: first diagram paragraph (image1)
+    # Para 534: last diagram paragraph (Figure 76 caption)
+    # Para 535: first post-diagram paragraph (empty line)
+    LAST_PRE  = 165
+    FIRST_DIA = 166
+    LAST_DIA  = 534
+    FIRST_POST = 535
 
-    # ── Find first image paragraph index (para 166 = image1) ──────────────────
-    # The pre-diagram content is paras 0–165 (indices 0-165)
-    PRE_END   = 165   # last para index of pre-diagram content (inclusive)
-    POST_START = 536  # first para index of post-diagram content
+    # ── Extract original sectPr from para 177 (2-col portrait, the pre-content section) ──
+    para177_el = para_to_child[177]
+    para177_pPr = para177_el.find(qn('w', 'pPr'))
+    orig_sect_pr_177 = para177_pPr.find(qn('w', 'sectPr'))
 
     # ── Get image dimensions ──────────────────────────────────────────────────
     print("Reading image dimensions …")
@@ -405,52 +417,53 @@ def main():
     print("Building diagram pages:")
     diagram_els = build_diagram_pages(image_dims)
 
-    # ── Assemble new body ─────────────────────────────────────────────────────
-    print("\nAssembling new document body …")
+    # ── Surgical body modification ────────────────────────────────────────────
+    print("\nModifying document body surgically …")
 
-    # Pre-diagram paragraphs (0–165) – keep as-is
-    pre_paras = [copy.deepcopy(p) for p in para_els[:PRE_END + 1]]
+    # 1. Add a section-ending sectPr to para 165 so the pre-content 2-column
+    #    section closes cleanly before the diagram pages begin.
+    para165_el = para_to_child[LAST_PRE]
+    para165_pPr = para165_el.find(qn('w', 'pPr'))
+    if para165_pPr is None:
+        para165_pPr = etree.Element(qn('w', 'pPr'))
+        para165_el.insert(0, para165_pPr)
+    # Don't double-add if already has one (re-run safety)
+    if para165_pPr.find(qn('w', 'sectPr')) is None:
+        pre_end_sectPr = make_pre_content_section_end(orig_sect_pr_177)
+        para165_pPr.append(pre_end_sectPr)
 
-    # The last pre-diagram para gets a section break to cleanly end the pre section
-    # We insert a new empty paragraph AFTER para 165 that ends the pre-content section
-    end_pre_sect = make_section_break_para(landscape=False)  # portrait for text section
+    # 2. Collect body children we need to remove (para 166 through para 534
+    #    inclusive) and the insertion anchor (para 535's body child).
+    children_to_remove = []
+    for idx in range(FIRST_DIA, LAST_DIA + 1):
+        if idx in para_to_child:
+            children_to_remove.append(para_to_child[idx])
 
-    # Post-diagram paragraphs (536+) – keep as-is, strip internal sectPrs then add final
-    post_paras = [copy.deepcopy(p) for p in para_els[POST_START:]]
-    # The body's final sectPr (portrait) will be added as the body-level sectPr
+    anchor_el = para_to_child.get(FIRST_POST)
 
-    # Build the final body sectPr (portrait, standard margins)
-    final_sect_pr = build_portrait_sect_pr_standard()
+    # 3. Remove the diagram-zone paragraphs from body
+    for el in children_to_remove:
+        body.remove(el)
+    print(f"  Removed {len(children_to_remove)} original diagram-zone paragraphs")
 
-    # ── Clear and repopulate body ─────────────────────────────────────────────
-    for child in list(body):
-        body.remove(child)
-
-    # Pre-content
-    for p in pre_paras:
-        body.append(p)
-
-    # Section break ending pre-content
-    body.append(end_pre_sect)
-
-    # Diagram pages
-    for el in diagram_els:
-        body.append(el)
-
-    # Post-content
-    for p in post_paras:
-        body.append(p)
-
-    # Final body-level sectPr
-    body.append(final_sect_pr)
+    # 4. Insert new diagram page elements immediately before the post-content anchor.
+    #    If anchor is missing (shouldn't happen), append before body sectPr.
+    # addprevious(el) inserts el immediately before anchor each time,
+    # so iterating forward gives the correct final order before anchor.
+    if anchor_el is not None:
+        for el in diagram_els:
+            anchor_el.addprevious(el)
+    else:
+        body_sect = body.find(qn('w', 'sectPr'))
+        for el in diagram_els:
+            body_sect.addprevious(el)
+    print(f"  Inserted {len(diagram_els)} diagram page elements ({len(diagram_els)//2} figures)")
 
     # ── Serialise back ────────────────────────────────────────────────────────
     print("Writing new document.xml …")
     new_xml = etree.tostring(tree, xml_declaration=True,
                               encoding='UTF-8', standalone=True)
 
-    # Rewrite the docx zip
-    import tempfile
     tmp = DST + '.tmp'
     with zipfile.ZipFile(DST, 'r') as zin, \
          zipfile.ZipFile(tmp, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
@@ -462,9 +475,6 @@ def main():
 
     os.replace(tmp, DST)
     print(f"\nDone! Saved to: {DST}")
-    print(f"  Pre-diagram paragraphs:  {PRE_END + 1}")
-    print(f"  Diagram page elements:   {len(diagram_els)} ({len(diagram_els)//2} figures)")
-    print(f"  Post-diagram paragraphs: {len(post_paras)}")
 
 
 if __name__ == '__main__':
